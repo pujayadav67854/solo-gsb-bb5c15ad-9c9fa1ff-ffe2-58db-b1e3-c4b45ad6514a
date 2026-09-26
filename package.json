@@ -5,7 +5,8 @@
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
-    "init-db": "node server/init-db.js"
+    "init-db": "node server/init-db.js",
+    "test": "node test-consecutive-versions.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.8.1",

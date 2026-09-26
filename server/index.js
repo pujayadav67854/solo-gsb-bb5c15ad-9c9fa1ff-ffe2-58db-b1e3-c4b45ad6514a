@@ -14,7 +14,7 @@ const {
   saveAssetFile,
   removeAssetFile,
 } = require('./assets');
-const { relocalize, buildAnchor } = require('./reanchor');
+const { relocalize, buildAnchor, snapshotAt } = require('./reanchor');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -169,6 +169,10 @@ app.patch('/api/scripts/:id', (req, res) => {
  * 事务内公共操作：把 content 保存为 scriptId 的递增新版本（正文快照写入 script_versions），
  * 并按现有重定位规则（reanchor）在同一事务内更新全部提示——
  * 自动绑定 / 待确认（缺失或重复台词无法唯一定位，保留候选行）。
+ * 成功自动绑定的提示同步刷新锚点行与相邻非空台词快照（anchor_index / anchor_text /
+ * context_before / context_after 取自新版正文的新定位行），使连续改版的后续迁移
+ * 以最近一次确认的绑定为依据；待确认提示保留原锚点与上下文快照，仅记录原因与候选行，
+ * 等待人工重绑。
  * 手工「保存新版」与「恢复历史版本」共用同一实现，保证行为一致、快照均不可变。
  * 须在事务内调用（或被 db.transaction 包裹）；返回新版本号与重定位统计。
  */
@@ -186,7 +190,9 @@ function persistVersionAndRelocalize(scriptId, content) {
   const { results, stats } = relocalize(cues, content);
 
   const boundStmt = db.prepare(
-    `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_status = 'bound',
+    `UPDATE cues SET version = ?, line_no = ?, line_text = ?,
+                     anchor_index = ?, anchor_text = ?, context_before = ?, context_after = ?,
+                     anchor_status = 'bound',
                      issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
      WHERE id = ?`
   );
@@ -198,8 +204,28 @@ function persistVersionAndRelocalize(scriptId, content) {
 
   for (const r of results) {
     if (r.status === 'bound') {
-      boundStmt.run(newVersion, r.lineNo, r.lineText, r.cueId);
+      // 以新定位行重做锚点与相邻非空台词快照：连续改版时后续迁移以本次确认的绑定为依据
+      const snap = snapshotAt(content, r.lineNo);
+      if (!snap) {
+        // 行号来自同一正文的匹配结果，正常不会越界；防御性兜底：交人工确认而非写坏锚点
+        const payload =
+          '__CANDIDATES__' +
+          JSON.stringify({ detail: '重定位结果异常，请人工重新绑定。', candidates: [] });
+        pendingStmt.run(newVersion, 'missing', payload, r.cueId);
+        continue;
+      }
+      boundStmt.run(
+        newVersion,
+        r.lineNo,
+        r.lineText,
+        snap.lineIndex,
+        snap.anchorText,
+        JSON.stringify(snap.contextBefore),
+        JSON.stringify(snap.contextAfter),
+        r.cueId
+      );
     } else {
+      // 待确认：保留原锚点与上下文快照（不动 anchor_* / context_* 列），附原因与候选行
       const payload =
         '__CANDIDATES__' +
         JSON.stringify({ detail: r.issueDetail, candidates: r.candidates || [] });
@@ -367,7 +393,8 @@ app.get('/api/scripts/:id/versions/:version/restore-preview', (req, res) => {
  *     在不改版本号的情况下新增/删除/改绑/修改了提示（凭据不一致），均返回 409 要求重新预览，
  *     绝不生成新版本、绝不改动任何提示（整笔事务回滚）；
  *  2. 目标历史快照原样保留、不被改动：其正文会另存为一个递增的新版本；
- *  3. 同一事务内按现有重定位规则把当前提示迁移到该正文——重复台词无法唯一定位时
+ *  3. 同一事务内按现有重定位规则把当前提示迁移到该正文——成功自动绑定的提示同步刷新
+ *     锚点行与相邻非空台词快照（与保存新版同一实现），重复台词无法唯一定位时
  *     保持待确认并附候选行，绝不会静默挂到另一句相同台词上。
  */
 app.post('/api/scripts/:id/versions/:version/restore', (req, res) => {

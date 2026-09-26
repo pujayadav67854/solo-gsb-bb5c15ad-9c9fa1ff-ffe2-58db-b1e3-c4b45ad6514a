@@ -11,6 +11,12 @@
  *  3. 0 处命中               -> 待确认（缺失，可能被删除或改写）；
  *  4. 多处命中               -> 用相邻行上下文打分，唯一最高分才自动绑定；
  *     并列或均无上下文匹配   -> 待确认（重复台词），返回候选行供人工选择。
+ *
+ * 连续改版：每次成功自动绑定都会以「新定位到的行」重做锚点与相邻非空台词快照
+ * （anchorText / anchorIndex / contextBefore / contextAfter），后续迁移以最近一次
+ * 确认的绑定为依据——例如 A/X/B 版的提示在 A/X/C 版自动绑定后，快照刷新为 X 行的
+ * 新相邻上下文（A / C），再保存 D/X/C 版时仍能自动绑定，而非停留在第 1 版快照误判待确认。
+ * 无法唯一定位（待确认）时不动原锚点与上下文快照，仅返回原因与候选行等待人工重绑。
  */
 
 const CONTEXT_WINDOW = 2; // 锚点前后各取 2 行非空文本作为上下文
@@ -184,6 +190,19 @@ function buildAnchor(content, lineIndex) {
   };
 }
 
+/**
+ * 以新定位到的行重做锚点与相邻非空台词快照（供成功自动绑定后落库）。
+ * lineNo 为 1 起始行号；越界（理论上不会发生，行号来自同一正文的匹配结果）返回 null。
+ */
+function snapshotAt(content, lineNo) {
+  if (!Number.isInteger(lineNo)) return null;
+  try {
+    return buildAnchor(content, lineNo - 1);
+  } catch {
+    return null;
+  }
+}
+
 module.exports = {
   normalize,
   splitLines,
@@ -191,4 +210,5 @@ module.exports = {
   locateOne,
   relocalize,
   buildAnchor,
+  snapshotAt,
 };
