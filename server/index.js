@@ -170,6 +170,12 @@ app.patch('/api/scripts/:id', (req, res) => {
  * 并按现有重定位规则（reanchor）在同一事务内更新全部提示——
  * 自动绑定 / 待确认（缺失或重复台词无法唯一定位，保留候选行）。
  * 手工「保存新版」与「恢复历史版本」共用同一实现，保证行为一致、快照均不可变。
+ *
+ * 连续改版语义：自动绑定成功的提示在同一事务内**同步刷新锚点行与相邻非空台词快照**
+ * （anchor_index / anchor_text / context_before / context_after 全部按新正文重取），
+ * 使下一次改版/恢复的迁移始终以最近一次确认的绑定为依据——
+ * 否则快照停留在旧版，连续两次改版后旧上下文与新正文完全不符，提示会被误判为待确认。
+ * 无法唯一定位的提示保留原锚点快照与候选行不变，等待人工重绑。
  * 须在事务内调用（或被 db.transaction 包裹）；返回新版本号与重定位统计。
  */
 function persistVersionAndRelocalize(scriptId, content) {
@@ -186,7 +192,8 @@ function persistVersionAndRelocalize(scriptId, content) {
   const { results, stats } = relocalize(cues, content);
 
   const boundStmt = db.prepare(
-    `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_status = 'bound',
+    `UPDATE cues SET version = ?, line_no = ?, line_text = ?, anchor_index = ?, anchor_text = ?,
+                     context_before = ?, context_after = ?, anchor_status = 'bound',
                      issue_type = NULL, issue_detail = NULL, updated_at = datetime('now')
      WHERE id = ?`
   );
@@ -198,8 +205,21 @@ function persistVersionAndRelocalize(scriptId, content) {
 
   for (const r of results) {
     if (r.status === 'bound') {
-      boundStmt.run(newVersion, r.lineNo, r.lineText, r.cueId);
+      // 绑定成功：以新正文中的实际命中行重建锚点快照（锚点台词 + 前后各 2 行非空上下文），
+      // 后续迁移即以这次确认的绑定为依据
+      const anchor = buildAnchor(content, r.lineNo - 1);
+      boundStmt.run(
+        newVersion,
+        r.lineNo,
+        r.lineText,
+        r.lineNo - 1,
+        anchor.anchorText,
+        JSON.stringify(anchor.contextBefore),
+        JSON.stringify(anchor.contextAfter),
+        r.cueId
+      );
     } else {
+      // 待确认：保留原锚点快照不动，仅记录原因与候选行，等待人工重绑
       const payload =
         '__CANDIDATES__' +
         JSON.stringify({ detail: r.issueDetail, candidates: r.candidates || [] });
